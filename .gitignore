@@ -1,0 +1,9 @@
+# Local state: the usage database and per-installation settings stay on each PC
+moneysaved.sqlite
+moneysaved.sqlite-journal
+config.json
+
+# Python and editor leftovers
+__pycache__/
+*.pyc
+.claude/
