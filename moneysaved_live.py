@@ -348,18 +348,21 @@ class LiveWindow:
         outer = self.outer = tk.Frame(self.root, bg=BG)
         outer.pack(fill="both", expand=True, padx=24, pady=(PAD_TOP, PAD_BOTTOM))
 
+        # The options name themselves (Pro / Max / Ultra, USD / EUR / DKK), so the switches carry no
+        # captions; that leaves room for the plan's price without widening the window.
         switches = tk.Frame(outer, bg=BG)
         switches.pack(fill="x")
-        label(switches, "Seat", SMALL, MUTED).pack(side="left", padx=(0, 8))
-        self.seat_switch = Segmented(
-            switches, [("standard", "Standard"), ("premium", "Premium")], self._set_seat
+        self.plan_switch = Segmented(
+            switches, [(key, name) for key, (name, _prices) in ms.PLANS.items()], self._set_plan
         )
-        self.seat_switch.pack(side="left")
-        label(switches, "Currency", SMALL, MUTED).pack(side="left", padx=(18, 8))
-        self.currency_switch = Segmented(switches, [("DKK", "DKK"), ("EUR", "EUR")], self._set_currency)
+        self.plan_switch.pack(side="left")
+        tk.Frame(switches, bg=BG, width=18).pack(side="left")
+        self.currency_switch = Segmented(
+            switches, [("USD", "USD"), ("EUR", "EUR"), ("DKK", "DKK")], self._set_currency
+        )
         self.currency_switch.pack(side="left")
-        self.seat_price_lbl = label(switches, "", SMALL, MUTED)
-        self.seat_price_lbl.pack(side="right")
+        self.plan_price_lbl = label(switches, "", SMALL, MUTED)
+        self.plan_price_lbl.pack(side="right", padx=(12, 0))
 
         self.caption_lbl = label(
             outer, "API value of this month's Claude Code usage on this PC", SMALL, MUTED, anchor="w"
@@ -432,8 +435,8 @@ class LiveWindow:
         self.stats_btn.config(text="▲" if self.stats_expanded else "▼")
         self._fit()
 
-    def _set_seat(self, value: str) -> None:
-        self._set_option("seat", value)
+    def _set_plan(self, value: str) -> None:
+        self._set_option("plan", value)
 
     def _set_currency(self, value: str) -> None:
         self._set_option("currency", value)
@@ -446,6 +449,7 @@ class LiveWindow:
             self.summary = ms.summary(self.db, self.cfg)
             self.error = None
             self._apply_summary()
+            self._fit()  # the price beside the switches changes length with the plan and currency
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
         self._show_error()
@@ -476,9 +480,10 @@ class LiveWindow:
     def _apply_summary(self) -> None:
         s, cfg = self.summary, self.cfg
         self.month_api.set(s["month_api"])
-        self.seat_switch.set(cfg["seat"])  # keeps the switches in step with changes made from the CLI
+        self.plan_switch.set(cfg["plan"])  # keeps the switches in step with changes made from the CLI
         self.currency_switch.set(cfg["currency"].upper())
-        self.seat_price_lbl.config(text=f"{ms.money(s['seat'], cfg)}/month ex VAT")
+        annual = " (annual)" if ms.plan_billing(cfg) == "annual" else ""
+        self.plan_price_lbl.config(text=f"{ms.money(s['plan_price'], cfg)}/month{annual} ex VAT")
         for name, (cells, odometer) in self.period_rows.items():
             p = s["periods"][name]
             odometer.set(p["api"])
@@ -506,26 +511,27 @@ class LiveWindow:
     def animate(self) -> None:
         if self.summary is not None:
             s, cfg = self.summary, self.cfg
-            seat = s["seat"]
+            price = s["plan_price"]
             api = self.month_api.step()
             self.big_lbl.config(text=ms.money(api, cfg))
 
-            saved = api - seat
-            if seat > 0 and saved >= 0:
+            saved = api - price
+            if price > 0 and saved >= 0:
                 self.bar_fraction, self.bar_color = 1.0, GREEN
                 self.bar_lbl.config(
-                    text=f"Seat paid off  ·  saved {ms.money(saved, cfg, signed=True)} so far this month", fg=GREEN
+                    text=f"{ms.plan_name(cfg)} paid off  ·  saved {ms.money(saved, cfg, signed=True)} so far this month",
+                    fg=GREEN,
                 )
-            elif seat > 0:
-                self.bar_fraction, self.bar_color = api / seat, AMBER
+            elif price > 0:
+                self.bar_fraction, self.bar_color = api / price, AMBER
                 self.bar_lbl.config(
-                    text=f"{api / seat * 100:.0f}% of the {ms.money(seat, cfg)} {cfg['seat']} seat  ·  "
+                    text=f"{api / price * 100:.0f}% of the {ms.money(price, cfg)} {ms.plan_name(cfg)} plan  ·  "
                     f"{ms.money(-saved, cfg)} to break-even",
                     fg=AMBER,
                 )
             else:
                 self.bar_fraction, self.bar_color = 0.0, MUTED
-                self.bar_lbl.config(text="Seat price is 0 in config.json", fg=MUTED)
+                self.bar_lbl.config(text="Plan price is 0 in config.json", fg=MUTED)
             self._draw_bar()
 
             if self.stats_expanded:

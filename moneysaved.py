@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Claude Code Costs - what your Claude Team seat saves compared with paying Anthropic API list prices.
+"""Claude Code Costs - what your Claude subscription saves compared with paying Anthropic API list prices.
 
 Reads the Claude Code transcripts in ~/.claude/projects, de-duplicates the streamed
 assistant records, prices every API call at Anthropic's pay-per-use list prices, and
-compares the monthly total with the price of the Team seat. Everything is kept in a
-local SQLite file next to this script, so history survives Claude Code pruning old
-transcripts.
+compares the monthly total with the price of your plan (Pro, Max or Ultra). Everything
+is kept in a local SQLite file next to this script, so history survives Claude Code
+pruning old transcripts.
 
 Usage
   python moneysaved.py                    scan transcripts, then print the report
-  python moneysaved.py seat premium       select the seat type: standard | premium
-  python moneysaved.py billing annual     select the billing cycle: annual | monthly
-  python moneysaved.py start 2026-01      first month the seat was paid for (earlier months are ignored)
-  python moneysaved.py currency DKK       display currency: EUR | DKK
+  python moneysaved.py plan max           select the plan: pro | max | ultra
+  python moneysaved.py billing annual     select the billing cycle: monthly | annual (Pro only)
+  python moneysaved.py start 2026-01      first month the plan was paid for (earlier months are ignored)
+  python moneysaved.py currency EUR       display currency: USD | EUR | DKK
   python moneysaved.py report [--months N] [--projects]
   python moneysaved.py status             one line for the current month (statusline friendly)
   python moneysaved.py live               open the live window (or double-click "Claude Code Costs.pyw")
@@ -36,27 +36,35 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 DB_PATH = HERE / "moneysaved.sqlite"
 
-# Seat prices: EUR per seat per month, excluding VAT, as shown at Anthropic's EU checkout.
-# USD list prices are standard $20 annual / $25 monthly and
-# premium $100 annual / $125 monthly. Edit config.json if your invoice says otherwise.
+# Subscription plans: display name, then the price per month excluding tax for each billing cycle
+# and currency. These are the US list prices on claude.com/pricing (checked 2026-11-16); Pro's annual
+# plan is $200 up front. Max and Ultra (formerly "Max 20x") are billed monthly only. Anthropic
+# publishes no EUR prices, so other currencies are converted from USD; config.json's
+# "price_overrides" can hold what you actually pay.
+PLANS = {
+    "pro": ("Pro", {"monthly": {"USD": 20.0}, "annual": {"USD": 200.0 / 12}}),
+    "max": ("Max", {"monthly": {"USD": 100.0}}),
+    "ultra": ("Ultra", {"monthly": {"USD": 200.0}}),
+}
+
 DEFAULT_CONFIG = {
-    "seat": "premium",
+    "plan": "max",
     "billing": "monthly",
-    "currency": "DKK",
+    "currency": "USD",
     "usd_per_eur": 1.16,
     "per_eur": {"EUR": 1.0, "DKK": 7.46},
-    "seat_prices": {
-        "standard": {"annual": 18.00, "monthly": 21.04},
-        "premium": {"annual": 90.00, "monthly": 105.23},
-    },
+    "price_overrides": {},
     "subscription_start": None,
     "transcripts_dir": None,
     "_notes": {
-        "seat_prices": "EUR per seat per month, ex VAT. USD list: standard 20/25, premium 100/125.",
-        "currency": "Display currency, any key of per_eur: EUR or DKK.",
+        "plan": "pro | max | ultra",
+        "billing": "monthly | annual. Annual applies to Pro; Max and Ultra are billed monthly only.",
+        "currency": "Display currency: USD, or any key of per_eur (EUR, DKK).",
         "usd_per_eur": "How many USD one EUR buys. API prices are USD; used to convert.",
         "per_eur": "Display-currency units per EUR. DKK is pegged to the euro at about 7.46.",
-        "subscription_start": "Optional YYYY-MM. Months before this are ignored for both usage and seat cost.",
+        "price_overrides": 'Optional: what you pay per month ex VAT where it differs from the list price, '
+        'e.g. {"pro": {"monthly": {"EUR": 18.0}}}. The list prices are in PLANS in moneysaved.py.',
+        "subscription_start": "Optional YYYY-MM. Months before this are ignored for both usage and plan cost.",
         "transcripts_dir": "Optional override. Default is ~/.claude/projects.",
     },
 }
@@ -123,22 +131,23 @@ def load_config() -> dict:
     else:
         cfg, created = {}, True
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    legacy = {}
     for k, v in cfg.items():
-        if k == "seat_prices" and isinstance(v, dict):
-            for seat, prices in v.items():
-                merged["seat_prices"].setdefault(seat, {}).update(prices)
-        elif k == "per_eur" and isinstance(v, dict):
-            merged["per_eur"].update(v)
-        elif k == "usd_per_unit":  # older config key; the unit was EUR, and the key is dropped
-            if "usd_per_eur" not in cfg:
-                merged["usd_per_eur"] = v
+        if k in ("seat", "seat_prices", "_notes"):  # Team seat settings of earlier versions are dropped;
+            continue  # the notes are always the current ones
+        if k == "usd_per_unit":  # older name for usd_per_eur (the unit was EUR)
+            legacy[k] = v
+        elif k in ("per_eur", "price_overrides") and isinstance(v, dict):
+            merged[k].update(v)
         else:
             merged[k] = v
+    if "usd_per_unit" in legacy and "usd_per_eur" not in cfg:
+        merged["usd_per_eur"] = legacy["usd_per_unit"]
     if created or merged != cfg:
         save_config(merged)
     if created:
-        print(f"Created {CONFIG_PATH.name} with defaults: premium seat, monthly billing, shown in DKK ex VAT.")
-        print("Change with:  python moneysaved.py seat standard   /   python moneysaved.py billing annual\n")
+        print(f"Created {CONFIG_PATH.name} with defaults: {describe_plan(merged)}.")
+        print("Change with:  python moneysaved.py plan pro   /   python moneysaved.py currency EUR\n")
     return merged
 
 
@@ -146,18 +155,52 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def fx(cfg: dict) -> float:
-    """Display-currency units per EUR (1.0 for EUR itself)."""
-    return float(cfg["per_eur"].get(cfg["currency"].upper(), 1.0))
+def per_eur(cfg: dict, currency=None) -> float:
+    """Units of `currency` (default: the display currency) per EUR."""
+    cur = (currency or cfg["currency"]).upper()
+    if cur == "USD":
+        return float(cfg["usd_per_eur"])
+    return float(cfg["per_eur"].get(cur, 1.0))
 
 
-def seat_price(cfg: dict) -> float:
-    """Seat price per month in the display currency."""
-    return float(cfg["seat_prices"][cfg["seat"]][cfg["billing"]]) * fx(cfg)
+def _plan(cfg: dict):
+    plan = PLANS.get(cfg.get("plan"))
+    if plan is None:
+        raise ValueError(f"unknown plan {cfg.get('plan')!r} in config.json; use one of: {', '.join(PLANS)}")
+    return plan
+
+
+def plan_name(cfg: dict) -> str:
+    return _plan(cfg)[0]
+
+
+def plan_billing(cfg: dict) -> str:
+    """The billing cycle in effect: the configured one, or monthly for a plan without that option."""
+    return cfg["billing"] if cfg["billing"] in _plan(cfg)[1] else "monthly"
+
+
+def plan_price(cfg: dict) -> float:
+    """The plan's price per month, excluding VAT, in the display currency. A price in
+    config.json's price_overrides is what you actually pay, so it replaces the list prices in every
+    currency. Uses a price in the display currency where there is one, otherwise converts the EUR
+    price, otherwise the USD price."""
+    billing = plan_billing(cfg)
+    over = ((cfg.get("price_overrides") or {}).get(cfg["plan"]) or {}).get(billing) or {}
+    known = {c.upper(): float(v) for c, v in over.items()} or dict(_plan(cfg)[1][billing])
+    cur = cfg["currency"].upper()
+    if cur in known:
+        return float(known[cur])
+    base = "EUR" if "EUR" in known else "USD"
+    return known[base] / per_eur(cfg, base) * per_eur(cfg)
+
+
+def describe_plan(cfg: dict) -> str:
+    """'Max, monthly billing, $100.00/month ex VAT'."""
+    return f"{plan_name(cfg)}, {plan_billing(cfg)} billing, {money(plan_price(cfg), cfg)}/month ex VAT"
 
 
 def usd_to_local(usd: float, cfg: dict) -> float:
-    return usd / float(cfg["usd_per_eur"]) * fx(cfg)
+    return usd / float(cfg["usd_per_eur"]) * per_eur(cfg)
 
 
 def money(v: float, cfg: dict, signed: bool = False) -> str:
@@ -479,9 +522,9 @@ def coverage_start(db: sqlite3.Connection):
 
 def partial_month(db: sqlite3.Connection, cfg: dict):
     """The month the stored history begins in, when it begins after the 1st and no subscription_start
-    vouches for the seat: ('2026-01', '14 Jan'), else None. Claude Code deletes transcripts after
+    vouches for the plan: ('2026-01', '14 Jan'), else None. Claude Code deletes transcripts after
     30 days, so the first month a fresh install sees is normally incomplete; setting a few days of
-    usage against a full seat fee would mislead, so that month is shown without a verdict."""
+    usage against a full month's fee would mislead, so that month is shown without a verdict."""
     if cfg.get("subscription_start"):
         return None
     d = coverage_start(db)
@@ -638,7 +681,7 @@ def report(db: sqlite3.Connection, cfg: dict, months=None, projects: bool = Fals
     if not per_month:
         print("No usage found yet. Run a Claude Code session, then `python moneysaved.py` again.")
         return
-    seat = seat_price(cfg)
+    price = plan_price(cfg)
     now = datetime.now().strftime("%Y-%m")
     first = cfg.get("subscription_start") or min(per_month)
     all_months = month_range(first, max(max(per_month), now))
@@ -647,20 +690,20 @@ def report(db: sqlite3.Connection, cfg: dict, months=None, projects: bool = Fals
     partial = partial_month(db, cfg)
     compared = [m for m in all_months if not (partial and m == partial[0] and m != now)]
 
-    rates = f"1 EUR = {float(cfg['usd_per_eur']):.4f} USD"
-    if cfg["currency"].upper() != "EUR":
-        rates += f", {fx(cfg):.4f} {cfg['currency'].upper()}"
-    print("Claude Code Costs  -  Claude Team seat vs. pay-per-use API")
-    print(
-        f"Seat: {cfg['seat'].capitalize()} ({cfg['billing']} billing) {money(seat, cfg)}/month ex VAT   |   "
-        f"{rates}   |   API at Anthropic USD list prices"
-    )
+    header = f"Plan: {describe_plan(cfg)}   |   API at Anthropic USD list prices"
+    if cfg["currency"].upper() != "USD":
+        rates = f"1 EUR = {float(cfg['usd_per_eur']):.4f} USD"
+        if cfg["currency"].upper() != "EUR":
+            rates += f", {per_eur(cfg):.4f} {cfg['currency'].upper()}"
+        header += f"   |   {rates}"
+    print("Claude Code Costs  -  Claude subscription vs. pay-per-use API")
+    print(header)
     print()
-    hdr = f"{'Month':<9}{'Calls':>7}{'Tokens':>9}{'API-equiv.':>14}{'Seat':>12}{'Saved':>14}"
+    hdr = f"{'Month':<9}{'Calls':>7}{'Tokens':>9}{'API-equiv.':>14}{'Plan':>12}{'Saved':>14}"
     print(hdr)
     print("-" * len(hdr))
     tot_calls = tot_tokens = 0
-    tot_api = tot_seat = 0.0
+    tot_api = tot_plan = 0.0
     for m in all_months:
         d = per_month.get(m, EMPTY_MONTH)
         api_local = usd_to_local(d["usd"] + d["extra"], cfg)
@@ -668,30 +711,30 @@ def report(db: sqlite3.Connection, cfg: dict, months=None, projects: bool = Fals
         if m not in compared:  # the stored history begins part-way through this month: shown, not judged
             print(f"{row}{'-':>12}{'-':>14}  (partial: data from {partial[1]})")
             continue
-        saved = api_local - seat
+        saved = api_local - price
         tot_calls += d["calls"]
         tot_tokens += d["tokens"]
         tot_api += api_local
-        tot_seat += seat
+        tot_plan += price
         tag = "  (so far)" if m == now else ""
-        print(f"{row}{money(seat, cfg):>12}{money(saved, cfg, signed=True):>14}{tag}")
+        print(f"{row}{money(price, cfg):>12}{money(saved, cfg, signed=True):>14}{tag}")
     print("-" * len(hdr))
-    tot_saved = tot_api - tot_seat
+    tot_saved = tot_api - tot_plan
     print(
         f"{'Total':<9}{tot_calls:>7}{fmt_tokens(tot_tokens):>9}{money(tot_api, cfg):>14}"
-        f"{money(tot_seat, cfg):>12}{money(tot_saved, cfg, signed=True):>14}"
+        f"{money(tot_plan, cfg):>12}{money(tot_saved, cfg, signed=True):>14}"
     )
     print()
     n = len(compared)
-    if tot_seat > 0:
-        ratio = tot_api / tot_seat
+    if tot_plan > 0:
+        ratio = tot_api / tot_plan
         verdict = "saved" if tot_saved >= 0 else "cost extra"
         print(
             f"Over {n} month(s) the same usage at API prices would have cost {money(tot_api, cfg)} "
-            f"against {money(tot_seat, cfg)} in seat fees: {verdict} {money(abs(tot_saved), cfg)} "
-            f"({ratio:.1f}x the seat price)."
+            f"against {money(tot_plan, cfg)} in {plan_name(cfg)} fees: {verdict} {money(abs(tot_saved), cfg)} "
+            f"({ratio:.1f}x the plan price)."
         )
-    print(f"Break-even: a month pays for the seat once API-equivalent usage passes {money(seat, cfg)}.")
+    print(f"Break-even: a month pays for the plan once API-equivalent usage passes {money(price, cfg)}.")
     extra_months = [(m, per_month[m]["extra"]) for m in all_months if m in per_month and per_month[m]["extra"] > 0]
     if extra_months:
         listed = ", ".join(f"{m} {money(usd_to_local(x, cfg), cfg)}" for m, x in extra_months)
@@ -701,8 +744,8 @@ def report(db: sqlite3.Connection, cfg: dict, months=None, projects: bool = Fals
         )
     if partial:
         print(
-            f"{partial[0]} is not compared with the seat: the stored history begins {partial[1]}, so that "
-            f"month's usage is incomplete. If the seat was paid for it, run  python moneysaved.py start {partial[0]}"
+            f"{partial[0]} is not compared with the plan: the stored history begins {partial[1]}, so that "
+            f"month's usage is incomplete. If the plan was paid for it, run  python moneysaved.py start {partial[0]}"
         )
     print()
 
@@ -734,9 +777,9 @@ def report(db: sqlite3.Connection, cfg: dict, months=None, projects: bool = Fals
 
 
 def summary(db: sqlite3.Connection, cfg: dict) -> dict:
-    """The headline numbers in the seat currency, used by `status` and the live window."""
+    """The headline numbers in the display currency, used by `status` and the live window."""
     per_month, _, _, unknown = aggregate(db, cfg)
-    seat = seat_price(cfg)
+    price = plan_price(cfg)
     now = datetime.now().strftime("%Y-%m")
     if per_month:
         first = cfg.get("subscription_start") or min(per_month)
@@ -746,7 +789,7 @@ def summary(db: sqlite3.Connection, cfg: dict) -> dict:
     partial = partial_month(db, cfg)
     compared = [m for m in months if not (partial and m == partial[0] and m != now)] or [now]
     tot_api = usd_to_local(sum(sum(per_month.get(m, EMPTY_MONTH)[k] for k in ("usd", "extra")) for m in compared), cfg)
-    tot_seat = seat * len(compared)
+    tot_plan = price * len(compared)
     cur = per_month.get(now, EMPTY_MONTH)
 
     def since(start) -> dict:
@@ -801,15 +844,15 @@ def summary(db: sqlite3.Connection, cfg: dict) -> dict:
     month_api = usd_to_local(cur["usd"], cfg) + month_extra
     return {
         "month": now,
-        "seat": seat,
+        "plan_price": price,
         "month_api": month_api,
         "month_unrecorded": month_extra,
-        "month_saved": month_api - seat,
+        "month_saved": month_api - price,
         "month_calls": cur["calls"],
         "month_tokens": cur["tokens"],
         "alltime_api": tot_api,
-        "alltime_seat": tot_seat,
-        "alltime_saved": tot_api - tot_seat,
+        "alltime_plan": tot_plan,
+        "alltime_saved": tot_api - tot_plan,
         "n_months": len(compared),
         "partial_month": partial,
         "last_hour": periods["Last hour"]["api"],
@@ -824,7 +867,7 @@ def summary(db: sqlite3.Connection, cfg: dict) -> dict:
 def status(db: sqlite3.Connection, cfg: dict) -> None:
     s = summary(db, cfg)
     print(
-        f"{s['month']}: {money(s['month_api'], cfg)} API-equiv vs {money(s['seat'], cfg)} {cfg['seat']} seat"
+        f"{s['month']}: {money(s['month_api'], cfg)} API-equiv vs {money(s['plan_price'], cfg)} {plan_name(cfg)}"
         f" | all time {money(s['alltime_saved'], cfg, signed=True)} over {s['n_months']} month(s)"
     )
 
@@ -856,14 +899,14 @@ def main(argv: list) -> int:
         pass
     ap = argparse.ArgumentParser(prog="moneysaved", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
-    p_seat = sub.add_parser("seat", help="select seat type")
-    p_seat.add_argument("value", choices=["standard", "premium"])
+    p_plan = sub.add_parser("plan", help="select the plan to compare with")
+    p_plan.add_argument("value", type=str.lower, choices=list(PLANS))
     p_bill = sub.add_parser("billing", help="select billing cycle")
-    p_bill.add_argument("value", choices=["annual", "monthly"])
-    p_start = sub.add_parser("start", help="first month the seat was paid for, YYYY-MM (or 'none')")
+    p_bill.add_argument("value", choices=["monthly", "annual"])
+    p_start = sub.add_parser("start", help="first month the plan was paid for, YYYY-MM (or 'none')")
     p_start.add_argument("value")
-    p_cur = sub.add_parser("currency", help="display currency")
-    p_cur.add_argument("value", type=str.upper, choices=["EUR", "DKK"])
+    p_cur = sub.add_parser("currency", help="display currency: USD, EUR, DKK (or any currency in per_eur)")
+    p_cur.add_argument("value", type=str.upper)
     p_rep = sub.add_parser("report", help="print the report without rescanning")
     p_rep.add_argument("--months", type=int, help="only show the last N months")
     p_rep.add_argument("--projects", action="store_true", help="add a per-project breakdown")
@@ -879,10 +922,16 @@ def main(argv: list) -> int:
     args = ap.parse_args(argv)
 
     cfg = load_config()
-    if args.cmd in ("seat", "billing", "currency"):
+    if args.cmd in ("plan", "billing", "currency"):
+        if args.cmd == "currency" and args.value != "USD" and args.value not in cfg["per_eur"]:
+            print(f"Unknown currency {args.value}: use USD, or add its rate to per_eur in config.json "
+                  f"(now: {', '.join(cfg['per_eur'])})", file=sys.stderr)
+            return 2
         cfg[args.cmd] = args.value
         save_config(cfg)
-        print(f"{args.cmd} = {args.value}  ->  seat price {money(seat_price(cfg), cfg)}/month ex VAT")
+        print(f"{args.cmd} = {args.value}  ->  {describe_plan(cfg)}")
+        if plan_billing(cfg) != cfg["billing"]:
+            print(f"{plan_name(cfg)} is billed monthly only, so the monthly price is used.")
         return 0
     if args.cmd == "start":
         value = None if args.value.lower() == "none" else args.value
@@ -898,7 +947,7 @@ def main(argv: list) -> int:
         return 0
     if args.cmd == "config":
         print(json.dumps({k: v for k, v in cfg.items() if not k.startswith("_")}, indent=2, ensure_ascii=False))
-        print(f"\nActive seat price: {money(seat_price(cfg), cfg)}/month   config file: {CONFIG_PATH}")
+        print(f"\nActive plan: {describe_plan(cfg)}   config file: {CONFIG_PATH}")
         return 0
     if args.cmd == "install-hook":
         install_hook()
